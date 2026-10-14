@@ -1,0 +1,45 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-ink-950: #07090d;
+  --color-ink-900: #0b0f15;
+  --color-ink-850: #10151d;
+  --color-ink-800: #151b25;
+  --color-ink-700: #1f2733;
+  --color-ink-600: #2c3646;
+  --color-ink-400: #6b778a;
+  --color-ink-300: #93a0b4;
+  --color-ink-100: #dde3ec;
+  --color-up: #22c55e;
+  --color-down: #f43f5e;
+  --color-warn: #f59e0b;
+  --font-mono: ui-monospace, 'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-ink-950);
+  color: var(--color-ink-100);
+}
+
+@keyframes flash-in {
+  from { background-color: rgb(56 189 248 / 0.18); }
+  to { background-color: transparent; }
+}
+.flash-in {
+  animation: flash-in 1.6s ease-out;
+}
+
+@keyframes risk-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(244 63 94 / 0.55); }
+  50% { box-shadow: 0 0 0 10px rgb(244 63 94 / 0); }
+}
+.risk-pulse {
+  animation: risk-pulse 1.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .risk-pulse, .flash-in { animation: none; }
+}

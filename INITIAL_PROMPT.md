@@ -95,7 +95,7 @@ Roughly 1-2 pages of markdown total.
 ### TASK DELIVERABLES
 SECURITY.md file with answers to the questions
 
-## TASK 4: Task 5 - Architecture & Handoff Reflection
+## TASK 4: Architecture & Handoff Reflection
 
     This role leads a team - we want to see how you'd set someone else up to work in code you wrote.
 ### TASK STATEMENT

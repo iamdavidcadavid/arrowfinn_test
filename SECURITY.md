@@ -1,0 +1,47 @@
+# SECURITY.md
+
+Threat model in one line: **a fill, position or balance reaching the wrong broker is the worst outcome**, followed by trader PII leaking from logs or payloads. Everything below is organized around those two things.
+
+## 1. Auth model
+
+**How the frontend authenticates to REST.** `POST /auth/login` (email + password, bcrypt, rate-limited to 10/min/IP) returns a signed HS256 JWT in an **httpOnly, SameSite=Strict cookie** (`backend/src/interface/http/auth.controller.ts`). The token carries only `sub` (trader id), `broker_id`, `iss`, `aud` and `exp` (8h). The browser sends it with `credentials: 'include'`; frontend JavaScript never sees the token (`frontend/lib/api.ts`), so an XSS can act as the user while the tab is open but cannot steal the session. `SessionGuard` verifies it and builds the `TenantContext`; `@CurrentTenant()` is the only way a controller gets a tenant. `GET /api/snapshot` takes **no ids at all**: there is no `:traderId` or `:accountId` to tamper with. Suspended traders (KYC `suspended`) cannot log in.
+
+**What stops a trader subscribing to another tenant's stream.** The socket is authenticated **once, at connection time**, in the namespace middleware (`backend/src/infrastructure/realtime/live.gateway.ts`, `afterInit`). The same cookie is verified with the same `TokenService`, and the socket is joined to exactly one room, `tenant:<broker_id>:trader:<trader_id>`, built from verified claims. The gateway has **no `@SubscribeMessage` handlers**, so the client has no message it can send to join, leave or name a room. Publishing goes through `publishFill(ctx, …)`, where `ctx` comes from the fill's account row read back inside that tenant's RLS transaction (`record-fill.use-case.ts`), not from the request. The socket is force-disconnected when the token expires. `test/live-gateway.spec.ts` runs a real Socket.IO server and proves: a fill for `BRK-ARWP/T-001` is not delivered to `BRK-SMPT/T-001` (same trader id, different tenant) or to `BRK-ARWP/T-002`, even after that client emits `join`/`subscribe` messages. It also proves that a forged payload, `alg: none` and a foreign Origin are all rejected.
+
+## 2. Tenant isolation
+
+**Where it is enforced**, from outermost to innermost:
+
+1. **Identity.** `broker_id` comes only from a verified JWT (`token.service.ts`, `algorithms: ['HS256']` pinned, issuer and audience checked, claim format validated).
+2. **Application.** Repositories never receive the Prisma client for tenant tables. They receive a transaction from `PrismaService.withTenant()`, which first runs `SELECT set_config('app.broker_id', $1, true)`. Queries also say `brokerId: ctx.brokerId` explicitly, which documents the intent and keeps the composite index usable.
+3. **Database (the real enforcement).** `prisma/migrations/0002_tenant_rls/migration.sql` enables and **FORCEs Row-Level Security** on `brokers`, `traders`, `accounts` and `fills` with `broker_id = current_setting('app.broker_id', true)`. The app connects as `snapshot_app`, a role that is not a superuser, not the table owner, and has `NOBYPASSRLS`. It can only `SELECT`, plus `INSERT` on `fills` (with a `WITH CHECK` policy). Migrations and the seed run as the owner, and that URL is unset before the server starts.
+4. **Schema.** `broker_id` is denormalized onto `accounts` and `fills`, with **composite foreign keys** `(account_id, broker_id) → accounts(id, broker_id)` and `(trader_id, broker_id) → traders(id, broker_id)`. No row can claim a different tenant than its parent.
+
+**If someone forgets `WHERE broker_id = ?` six months from now**, RLS still filters every statement in the transaction. If they bypass `withTenant()` entirely, `app.broker_id` is unset, `current_setting(..., true)` is NULL, and the query returns **zero rows**: the failure is "empty page", never "everyone's data". Both behaviors are pinned by `test/tenant-isolation.db.spec.ts`, which runs against the real seeded Postgres as the app role (`docker compose --profile test run --rm backend-test`). It checks that an unfiltered `findMany()` only sees the current tenant, that no tenant set means zero rows, that a cross-tenant `INSERT` is refused, and that a token claiming the wrong broker for a real trader gets a 404. The two legitimate cross-tenant lookups, login-by-email and the dev simulator's account→broker lookup, are narrow `SECURITY DEFINER` functions that return a few columns and nothing else.
+
+## 3. PII handling
+
+**What I treated as sensitive:** every structured column of `traders.csv` (name, email, phone, DOB, `ssn_last4`, address) and, above all, the free-text `notes` and `audit_notes`. They contain bank account and routing numbers, national ids (personnummer, NI number), S3 paths to passport scans, a spouse's phone number, compliance case numbers, and an explicit "do not surface in client-facing views". I also treated `api_key_hash`, account balances and account numbers as sensitive.
+
+**What I stored:** only `id, broker_id, first_name, last_name, email, kyc_status` and a bcrypt hash. `prisma/seed.ts` reads the other columns and **drops them**, so DOB, SSN, phone, address, notes, audit_notes and the broker API key hash never reach the database. The cheapest PII to protect is PII you never stored. The snapshot only needed a display name and a login identifier.
+
+**What I logged vs. redacted:** logs carry opaque ids only (`trader=T-005 broker=BRK-SMPT`, `fill seq=… account=…`). Login failures log neither the submitted email nor the password. Request bodies are never logged. Inputs that do reach logs are format-validated first (`^ACC-\d{4}$`, `^[A-Z0-9]{1,6}$`), which also closes log injection.
+
+**DB vs. WebSocket:** in the DB, PII is protected at rest by role grants and RLS, and has a long lifetime: backups, replicas, analytics exports. If we did have to store notes, they would go in a separate table with column-level encryption (KMS envelope keys per broker), a separate grant, and audit on read. Over the WebSocket, data is ephemeral but **fans out to every connected client in the room** and lands in browser memory, devtools and any client-side error reporter. So the push payload is minimized: the fill's symbol, side, qty, price and time plus the recomputed account numbers. It carries no broker id, trader name, email, order id or notes. The REST response follows the same contract and exposes `"Elena V."` rather than a full name or email, which `get-snapshot.use-case.spec.ts` asserts.
+
+## 4. One vulnerability I didn't introduce: cross-site WebSocket hijacking
+
+Choosing httpOnly cookies over a bearer token in `localStorage` removed token theft by XSS, but it **created** a different hole. Browsers attach cookies to WebSocket upgrade requests, and **CORS does not apply to WebSockets**. Without a further check, any page the trader visits (`evil.example`) could open `io('http://localhost:4000/live')`. The browser would send the session cookie, the server would authenticate it, and the attacker's page would receive the trader's fills. That is cross-tenant leakage to someone with no account at all. Socket.IO's `cors` option does not stop it, because it only governs the HTTP long-polling transport. The fix is an Origin allowlist checked on **every handshake, before auth**:
+
+```ts
+// backend/src/infrastructure/realtime/socket-io.adapter.ts
+allowRequest: (req, cb) => cb(null, this.allowedOrigins.includes(req.headers.origin ?? '')),
+```
+
+`SameSite=Strict` on the cookie is a second, independent layer. The test `rejects a valid session presented from a foreign origin` in `live-gateway.spec.ts` connects with a valid token and `Origin: https://evil.example`, and expects a refusal. Related: `algorithms: ['HS256']` in `token.service.ts` closes JWT `alg: none` and RS/HS key confusion, which is also tested.
+
+**Dev fill simulator in production:** `POST /dev/fills` is not "disabled" in production. It is **absent**. `DevModule` is imported only when `ENABLE_DEV_ENDPOINTS=true` and `NODE_ENV !== 'production'` (`app.module.ts`). `main.ts` refuses to boot if both flags are set together. The Docker image defaults to `NODE_ENV=production`; only `docker-compose.yml`, a local dev stack, opts in.
+
+## 5. What I'd do in production but didn't
+
+Move the JWT secret to a KMS/Secrets Manager-managed **asymmetric** key (EdDSA with `kid` rotation), so services that verify tokens cannot mint them. Add short-lived access tokens with refresh rotation and a server-side revocation list in Redis, so a suspended trader's open socket is killed immediately instead of at token expiry, and so login rate limiting is per account across instances, not per IP per process. Add an append-only **audit log** (who read which account's snapshot, every login, every dev or admin action), shipped to a separate account. Add **structured logging with a redaction allowlist**, using pino serializers that only emit known-safe fields so that a future `log.info(req.body)` cannot leak email or notes. If notes must be kept, store them in **KMS-encrypted columns** with per-tenant data keys so one tenant's key compromise is contained. Use a Redis adapter for Socket.IO so tenant rooms work across instances. Add CSP with nonces instead of `'unsafe-inline'`, TLS everywhere with `Secure` cookies, a CSRF token on the login POST, and a CI check that fails if any new table in `schema.prisma` lacks an RLS policy. Finally, add a second RLS dimension on `app.trader_id`, so a forgotten trader filter within a tenant is caught the same way a forgotten broker filter is today.

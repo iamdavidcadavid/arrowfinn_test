@@ -1,0 +1,136 @@
+// Trader Daily Snapshot schema.
+//
+// Tenant model: broker_id is the tenant key. It is denormalised onto every
+// tenant-owned table (traders, accounts, fills) so that:
+//   1. Postgres Row-Level Security can filter each table with a plain
+//      `broker_id = current_setting('app.broker_id')` predicate (see the
+//      migration SQL), and
+//   2. composite foreign keys (account -> trader, fill -> account) include
+//      broker_id, so a row can never claim a different tenant than its parent.
+//
+// Instruments and market prices are global reference data (no tenant).
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BrokerType {
+  retail
+  prop
+}
+
+enum Side {
+  BUY
+  SELL
+}
+
+model Broker {
+  id             String     @id
+  name           String
+  type           BrokerType
+  whiteLabelName String     @map("white_label_name")
+  createdAt      DateTime   @map("created_at")
+  traders        Trader[]
+
+  @@map("brokers")
+}
+
+// Only the columns the app needs are stored. DOB, SSN last4, phone, address and
+// the free-text notes/audit_notes columns from traders.csv are deliberately NOT
+// loaded (see SECURITY.md, "PII handling").
+model Trader {
+  id           String    @id
+  brokerId     String    @map("broker_id")
+  firstName    String    @map("first_name")
+  lastName     String    @map("last_name")
+  email        String    @unique
+  kycStatus    String    @map("kyc_status")
+  passwordHash String    @map("password_hash")
+  createdAt    DateTime  @map("created_at")
+  broker       Broker    @relation(fields: [brokerId], references: [id])
+  accounts     Account[]
+
+  @@unique([id, brokerId])
+  @@map("traders")
+}
+
+model Account {
+  id              String   @id
+  brokerId        String   @map("broker_id")
+  traderId        String   @map("trader_id")
+  accountNumber   String   @map("account_number")
+  accountType     String   @map("account_type")
+  balance         Decimal  @db.Decimal(18, 2)
+  buyingPower     Decimal  @map("buying_power") @db.Decimal(18, 2)
+  maxPositionSize Int      @map("max_position_size")
+  status          String
+  createdAt       DateTime @map("created_at")
+  // Composite FK: the account's broker_id must equal its trader's broker_id.
+  trader          Trader   @relation(fields: [traderId, brokerId], references: [id, brokerId])
+  fills           Fill[]
+
+  @@unique([id, brokerId])
+  // "List this trader's accounts inside this tenant" - the first query of every snapshot.
+  @@index([brokerId, traderId])
+  @@map("accounts")
+}
+
+model Instrument {
+  symbol               String  @id
+  description          String
+  exchange             String
+  pointValueUsd        Decimal @map("point_value_usd") @db.Decimal(18, 6)
+  tickSize             Decimal @map("tick_size") @db.Decimal(18, 6)
+  tickValueUsd         Decimal @map("tick_value_usd") @db.Decimal(18, 2)
+  initialMarginUsd     Decimal @map("initial_margin_usd") @db.Decimal(18, 2)
+  maintenanceMarginUsd Decimal @map("maintenance_margin_usd") @db.Decimal(18, 2)
+  marketPrice          MarketPrice?
+  fills                Fill[]
+
+  @@map("instruments")
+}
+
+model MarketPrice {
+  symbol     String     @id
+  markPrice  Decimal    @map("mark_price") @db.Decimal(18, 6)
+  asOf       DateTime   @map("as_of")
+  instrument Instrument @relation(fields: [symbol], references: [symbol])
+
+  @@map("market_prices")
+}
+
+model Fill {
+  id               String     @id
+  // Monotonic sequence assigned by Postgres on insert. Pushed with every live
+  // event so a reconnecting client can tell whether it missed fills.
+  seq              BigInt     @unique @default(autoincrement())
+  brokerId         String     @map("broker_id")
+  accountId        String     @map("account_id")
+  instrumentSymbol String     @map("instrument_symbol")
+  side             Side
+  quantity         Int
+  price            Decimal    @db.Decimal(18, 6)
+  filledAt         DateTime   @map("filled_at")
+  orderId          String     @map("order_id")
+  liquidity        String
+  commissionUsd    Decimal    @map("commission_usd") @db.Decimal(18, 2)
+  // Composite FK: a fill can only belong to an account of the same tenant.
+  account          Account    @relation(fields: [accountId, brokerId], references: [id, brokerId])
+  instrument       Instrument @relation(fields: [instrumentSymbol], references: [symbol])
+
+  // THE index for the snapshot. The hot query is
+  //   WHERE broker_id = $tenant AND account_id IN (...) AND filled_at <= $now
+  //   ORDER BY filled_at, seq
+  // broker_id leads because RLS adds `broker_id = current_setting(...)` to every
+  // query on this table; account_id narrows to the trader's accounts; filled_at
+  // makes the session window a range scan that is already in the order the
+  // position/P&L fold needs, so Postgres never sorts or touches other tenants' rows.
+  @@index([brokerId, accountId, filledAt])
+  @@map("fills")
+}
